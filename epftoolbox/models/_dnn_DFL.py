@@ -21,11 +21,52 @@ from tensorflow.keras.regularizers import l2, l1
 from tensorflow.keras.layers import LeakyReLU, PReLU
 import tensorflow.keras.backend as K
 
+
+import warnings
+warnings.filterwarnings("ignore", message="Do not pass an `input_shape`/`input_dim` argument")
+
+
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
 from epftoolbox.evaluation import MAE, sMAPE
 from epftoolbox.data import scaling
 from epftoolbox.data import read_data
 
-class DNNModel(object):
+import pyepo
+from pyepo.func.abcmodule import optModule
+from pyepo.func.utlis import _solve_or_cache
+        
+class Loss_dispatcher(object):
+    def __init__(self, loss_name, optmodel, n_samples=1, sigma=1, lambd=1):
+        self.name = loss_name
+        if loss_name == 'SPO':
+            self.loss = pyepo.func.SPOPlus(optmodel, processes=1)
+        elif loss_name == 'FY':
+            self.loss = pyepo.func.perturbedFenchelYoung(optmodel, n_samples=1, sigma=0, processes=1)
+        elif loss_name == 'DPO':
+            self.loss = pyepo.func.perturbedOpt(optmodel, n_samples=n_samples, sigma=sigma, processes=1)
+        elif loss_name == 'DBB':
+            self.loss = pyepo.func.implicitMLE(optmodel, n_samples=1, sigma=0, lambd=lambd, two_sides=False, processes=1)
+        else:
+            raise ValueError(f"Unknown DFL loss name: {loss_name!r}")
+            
+    def call(self, cp, c, w, z):
+        loss= 0
+        if self.name == 'SPO':
+            loss = self.loss(cp, c, w, z)
+        if self.name == 'FY':
+            loss = self.loss(cp, w)
+        if self.name in ['DPO', 'DBB']:
+            wp = self.loss(cp)
+            loss = (wp * c).sum() - (w * c).sum()
+        return loss
+        
+
+
+
+class DNNModel_DFL(object):
 
     """Basic DNN model based on keras and tensorflow. 
     
@@ -83,7 +124,8 @@ class DNNModel(object):
 
 
     
-    def __init__(self, neurons, n_features, outputShape=24, dropout=0, batch_normalization=False, lr=None,
+    def __init__(self, neurons, n_features, optmodel, outputShape=24, dropout=0, batch_normalization=False, c_reg=None,
+                 lr=None, n_samples=None, sigma=None, lambd=None, 
                  verbose=False, epochs_early_stopping=40, scaler=None, loss='mae',
                  optimizer='adam', activation='relu', initializer='glorot_uniform',
                  regularization=None, lambda_reg=0):
@@ -104,22 +146,26 @@ class DNNModel(object):
         self.initializer = initializer
         self.regularization = regularization
         self.lambda_reg = lambda_reg
-
+        self.c_reg = c_reg
+        self.kappa_c_reg = c_reg['kappa']
+        
+        #define model
         self.model = self._build_model()
 
-        if lr is None:
-            opt = 'adam'
-        else:
-            if optimizer == 'adam':
-                opt = kr.optimizers.Adam(learning_rate =lr, clipvalue=10000)
-            if optimizer == 'RMSprop':
-                opt = kr.optimizers.RMSprop(learning_rate =lr, clipvalue=10000)
-            if optimizer == 'adagrad':
-                opt = kr.optimizers.Adagrad(learning_rate =lr, clipvalue=10000)
-            if optimizer == 'adadelta':
-                opt = kr.optimizers.Adadelta(learning_rate =lr, clipvalue=10000)
-
-        self.model.compile(loss=loss, optimizer=opt)
+        if optimizer == 'adam':
+            self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
+        if optimizer == 'RMSprop':
+            self.opt = torch.optim.RMSprop(self.model.parameters(), lr=lr)
+        if optimizer == 'adagrad':
+            self.opt = torch.optim.Adagrad(self.model.parameters(), lr=lr)
+        if optimizer == 'adadelta':
+            self.opt = torch.optim.Adadelta(self.model.parameters(), lr=lr)
+        
+        #Define loss
+        self.loss = Loss_dispatcher(loss, optmodel, n_samples=n_samples, sigma=sigma, lambd=lambd)
+        
+        # Prepare regret retrieval
+        self.optModule = optModule(optmodel, processes=1, solve_ratio=1, reduction="mean",dataset=None)
 
     def _reg(self, lambda_reg):
         """Internal method to build an l1 or l2 regularizer for the DNN
@@ -140,6 +186,11 @@ class DNNModel(object):
             return l1(lambda_reg)
         else:
             return None
+            
+    def _c_reg(self, cp):
+        
+        return cp / (1 + torch.linalg.norm(cp, dim=1, keepdim=True) / self.kappa_c_reg)
+        
 
     def _build_model(self):
         """Internal method that defines the structure of the DNN
@@ -188,94 +239,103 @@ class DNNModel(object):
 
         output_layer = Dense(self.outputShape, kernel_initializer=self.initializer,
                              kernel_regularizer=self._reg(self.lambda_reg))(past_Dense)
+                             
         model = Model(inputs=[past_data], outputs=[output_layer])
 
         return model
 
-    def _obtain_metrics(self, X, Y):
+    def _obtain_metrics(self, dataloader):
         """Internal method to update the metrics used to train the network
         
         Parameters
         ----------
-        X : numpy.array
-            Input array for evaluating the model
-        Y : numpy.array
-            Output array for evaluating the model
+        dataloader : torch.Dataloader for evaluating the model
         
         Returns
         -------
         list
             A list containing the metric based on the loss of the neural network and a second metric
-            representing the MAE of the DNN
+            representing the regret of the DNN
         """
-        error = self.model.evaluate(X, Y, verbose=0)
-        Ybar = self.model.predict(X, verbose=0)
+        
+        error = 0
+        regret = 0
+        gt_cost = 0
+        for data in dataloader:
+            x, c, w, z = data
+            # forward pass
+            cp = self.model(x)
+            # loss compute
+            if self.c_reg=='proj':
+                cp = self._c_reg(cp)
+            error += self.loss.call(cp, c, w, z)
+            #regret compute
+            wp, obj = _solve_or_cache(cp.detach(), self.optModule)
+            regret += (wp * c).sum() - (w * c).sum()
+            gt_cost += (w * c).sum()
+        regret *= 1./gt_cost
 
-        if self.scaler is not None:
-            if len(Y.shape) == 1:
-                Y = Y.reshape(-1, 1)
-                Ybar = Ybar.reshape(-1, 1)
+        return error, regret
 
-            Y = self.scaler.inverse_transform(Y)
-            Ybar = self.scaler.inverse_transform(Ybar)
-
-        mae = MAE(Y, Ybar)
-
-        return error, np.mean(mae)
-
-    def _display_info_training(self, bestError, bestMAE, countNoImprovement):
+    def _display_info_training(self, bestError, bestRegret, countNoImprovement):
         """Internal method that displays useful information during training
         
         Parameters
         ----------
         bestError : float
             Loss of the neural network in the validation dataset
-        bestMAE : float
+        bestRegret : float
             MAE of the neural network in the validation dataset
         countNoImprovement : int
             Number of epochs in the validation dataset without improvements
         """
         print(" Best error:\t\t{:.1e}".format(bestError))
-        print(" Best MAE:\t\t{:.2f}".format(bestMAE))                
+        print(" Best regret:\t\t{:.2f}".format(bestRegret))                
         print(" Epochs without improvement:\t{}\n".format(countNoImprovement))
 
 
-    def fit(self, trainX, trainY, valX, valY):
+    def fit(self, dataloader_train, dataloader_val):
         """Method to estimate the DNN model.
         
         Parameters
         ----------
-        trainX : numpy.array
-            Inputs fo the training dataset.
-        trainY : numpy.array
-            Outputs fo the training dataset.
-        valX : numpy.array
-            Inputs fo the validation dataset used for early-stopping.
-        valY : numpy.array
-            Outputs fo the validation dataset used for early-stopping.
+        dataloader_train : torch.Dataloader for training the model
+        dataloader_eval: torch.Dataloader for evaluating the model
+
         """
 
         # Variables to control training improvement
         bestError = 1e20
-        bestMAE = 1e20
+        bestRegret = 1e20
 
         countNoImprovement = 0
 
         bestWeights = self.model.get_weights()
 
-        for epoch in range(1000):
+        for epoch in range(2):
             start_time = time.time()
 
-            self.model.fit(trainX, trainY, batch_size=192,
-                           epochs=1, verbose=False, shuffle=True)
+            for data in dataloader_train:
+                x, c, w, z = data
+                # forward pass
+                cp = self.model(x)
+                # loss compute
+                if self.c_reg=='proj':
+                    cp = self._c_reg(cp)
+                loss = self.loss.call(cp, c, w, z)
+                # backward pass
+                self.opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_value_(self.model.parameters(), 10000)
+                self.opt.step()
 
             # Updating epoch metrics and displaying useful information
             if self.verbose:
-                print("\nEpoch {} of {} took {:.3f}s".format(epoch + 1, 1000,
+                print("\nEpoch {} of {} took {:.3f}s".format(epoch + 1, 100,
                                                              time.time() - start_time))
 
             # Calculating relevant metrics to perform early-stopping
-            valError, valMAE = self._obtain_metrics(valX, valY)
+            valError, valRegret = self._obtain_metrics(dataloader_val)
 
             # Early-stopping
             # Checking if current validation metrics are better than best so far metrics.
@@ -286,25 +346,25 @@ class DNNModel(object):
                 bestWeights = self.model.get_weights()
 
                 bestError = valError
-                bestMAE = valMAE
-                if valMAE < bestMAE:
-                    bestMAE = valMAE
+                bestRegret = valRegret
+                if valRegret < bestRegret:
+                    bestRegret = valRegret
 
-            elif valMAE < bestMAE:
+            elif valRegret < bestRegret:
                 countNoImprovement = 0
                 bestWeights = self.model.get_weights()
-                bestMAE = valMAE
+                bestRegret = valRegret
             else:
                 countNoImprovement += 1
 
             if countNoImprovement >= self.epochs_early_stopping:
                 if self.verbose:
-                    self._display_info_training(bestError, bestMAE, countNoImprovement)
+                    self._display_info_training(bestError, bestRegret, countNoImprovement)
                 break
 
             # Displaying final information
             if self.verbose:
-                self._display_info_training(bestError, bestMAE, countNoImprovement)
+                self._display_info_training(bestError, bestRegret, countNoImprovement)
 
         # After early-stopping, the best weights are set in the model
         self.model.set_weights(bestWeights)
@@ -325,7 +385,8 @@ class DNNModel(object):
             Output of the DNN after making the prediction.
         """
 
-        Ybar = self.model.predict(X, verbose=0)
+        Ybar = self.model(torch.from_numpy(X)).detach().numpy()
+        
         return Ybar
 
     def clear_session(self):
@@ -340,7 +401,7 @@ class DNNModel(object):
         K.clear_session()
 
 
-class DNN(object):
+class DNN_DFL(object):
 
     """DNN for electricity price forecasting. 
     
@@ -390,7 +451,7 @@ class DNN(object):
     
     """
 
-    def __init__(self, experiment_id, path_hyperparameter_folder=os.path.join('.', 'experimental_files'), 
+    def __init__(self, experiment_id, optmodel, path_hyperparameter_folder=os.path.join('.', 'experimental_files'), 
                  nlayers=2, dataset='PJM', years_test=2, shuffle_train=1, data_augmentation=0, 
                  calibration_window=4):
 
@@ -399,6 +460,7 @@ class DNN(object):
         if not os.path.exists(self.path_hyperparameter_folder):
             raise Exception('Provided directory for hyperparameter file does not exist')
 
+        self.optmodel = optmodel
         self.experiment_id = experiment_id
         self.nlayers = nlayers
         self.years_test = years_test
@@ -490,17 +552,25 @@ class DNN(object):
             
         np.random.seed(int(self.best_hyperparameters['seed']))
 
-        self.model = DNNModel(neurons=neurons, n_features=Xtrain.shape[-1], 
+        self.model = DNNModel_DFL(neurons=neurons, n_features=Xtrain.shape[-1], optmodel = self.optmodel,
                               dropout=self.best_hyperparameters['dropout'], 
                               batch_normalization=self.best_hyperparameters['batch_normalization'], 
-                              lr=self.best_hyperparameters['lr'], verbose=False,
-                              optimizer='adam', activation=self.best_hyperparameters['activation'],
+                              lr=self.best_hyperparameters['lr'], num_samples=self.best_hyperparameters['num_samples'], 
+                              sigma=self.best_hyperparameters['sigma'], lambd=self.best_hyperparameters['lambd'],
+                              verbose=True, optimizer='adam', activation=self.best_hyperparameters['activation'],
                               epochs_early_stopping=20, scaler=self.scaler, loss='mae',
                               regularization=self.best_hyperparameters['reg'], 
                               lambda_reg=self.best_hyperparameters['lambdal1'],
                               initializer=self.best_hyperparameters['init'])
 
-        self.model.fit(Xtrain, Ytrain, Xval, Yval)
+        # build training dataloader
+        dataset = pyepo.data.dataset.optDataset(self.optmodel, Xtrain, Ytrain)
+        dataloader_train = DataLoader(dataset, batch_size=192, shuffle=True)
+        # build validation dataloader
+        dataset = pyepo.data.dataset.optDataset(self.optmodel, Xval, Yval)
+        dataloader_val = DataLoader(dataset, batch_size=192, shuffle=True)
+
+        self.model.fit(dataloader_train, dataloader_val)
         
     def recalibrate_predict(self, Xtrain, Ytrain, Xval, Yval, Xtest):
         """Method that first recalibrates the DNN model and then makes a prediction.
@@ -604,7 +674,7 @@ class DNN(object):
 
         return Yp
 
-def evaluate_dnn_in_test_dataset(experiment_id, path_datasets_folder=os.path.join('.', 'datasets'), 
+def evaluate_dnn_in_test_dataset_DFL(experiment_id, optmodel, path_datasets_folder=os.path.join('.', 'datasets'), 
                                  path_hyperparameter_folder=os.path.join('.', 'experimental_files'), 
                                  path_recalibration_folder=os.path.join('.', 'experimental_files'), 
                                  nlayers=2, dataset='PJM', years_test=2, shuffle_train=True, 
@@ -721,7 +791,7 @@ def evaluate_dnn_in_test_dataset(experiment_id, path_datasets_folder=os.path.joi
     else:
         forecast_dates = forecast.index
 
-    model = DNN(experiment_id=experiment_id, path_hyperparameter_folder=path_hyperparameter_folder,
+    model = DNN_DFL(experiment_id=experiment_id, optmodel=optmodel, path_hyperparameter_folder=path_hyperparameter_folder,
                 nlayers=nlayers, dataset=dataset, years_test=years_test, 
                 shuffle_train=shuffle_train, data_augmentation=data_augmentation, 
                 calibration_window=calibration_window)
@@ -735,7 +805,7 @@ def evaluate_dnn_in_test_dataset(experiment_id, path_datasets_folder=os.path.joi
         data_available = pd.concat([df_train, df_test.loc[:date + pd.Timedelta(hours=23), :]], axis=0)
 
         # We set the real prices for current date to NaN in the dataframe of available data
-        data_available.loc[date:date + pd.Timedelta(hours=23), 'Price'] = np.NaN
+        data_available.loc[date:date + pd.Timedelta(hours=23), 'Price'] = np.nan
 
         # Recalibrating the model with the most up-to-date available data and making a prediction
         # for the next day
@@ -755,6 +825,7 @@ def evaluate_dnn_in_test_dataset(experiment_id, path_datasets_folder=os.path.joi
         forecast.to_csv(forecast_file_path)
 
     return forecast
+
 
 def format_best_trial(best_trial):
     """Function to format the best_trial object to a python dictionary.
